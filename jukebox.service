@@ -1,0 +1,18 @@
+[Unit]
+Description=EMOM Jukebox
+After=local-fs.target sound.target
+
+[Service]
+User=jukebox
+Group=audio
+SupplementaryGroups=audio
+WorkingDirectory=/opt/jukebox
+EnvironmentFile=-/etc/jukebox/jukebox.env
+ExecStart=/opt/jukebox/.venv/bin/gunicorn --bind 0.0.0.0:443 --workers 1 --certfile ${JUKEBOX_CERT} --keyfile ${JUKEBOX_KEY} wsgi:app
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

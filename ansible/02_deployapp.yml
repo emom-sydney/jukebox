@@ -1,0 +1,25 @@
+- hosts: jukebox
+  become: true
+  vars:
+    jukebox_dir: /opt/jukebox
+    jukebox_music_roots: /media/jukebox
+    jukebox_hostname: jukebox
+  tasks:
+    - name: Ensure Ansible has a private remote staging directory
+      ansible.builtin.raw: >-
+        install -d -m 0700 -o {{ ansible_facts.user_id }} -g {{ ansible_facts.user_gid | default(ansible_facts.user_id) }}
+        /tmp/ansible-jukebox
+      changed_when: false
+    - name: Install application
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ jukebox_dir }}/"
+        owner: jukebox
+        group: jukebox
+    - name: Enable and start jukebox
+      ansible.builtin.systemd:
+        name: jukebox
+        daemon_reload: true
+        enabled: true
+        state: restarted
+

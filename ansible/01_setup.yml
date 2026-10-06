@@ -1,0 +1,161 @@
+- hosts: jukebox
+  become: true
+  vars:
+    jukebox_dir: /opt/jukebox
+    jukebox_music_roots: /media/jukebox
+    jukebox_hostname: jukebox
+  tasks:
+    - name: Ensure Ansible has a private remote staging directory
+      ansible.builtin.raw: >-
+        install -d -m 0700 -o {{ ansible_facts.user_id }} -g {{ ansible_facts.user_gid | default(ansible_facts.user_id) }}
+        /tmp/ansible-jukebox
+      changed_when: false
+    - name: Install runtime packages
+      ansible.builtin.apt:
+        name: [python3, python3-venv, ffmpeg, mpv, openssl, avahi-daemon, libnss-mdns, util-linux, mount]
+        update_cache: true
+        state: present
+    - name: Set the Pi hostname used for mDNS
+      ansible.builtin.hostname:
+        name: "{{ jukebox_hostname }}"
+    - name: Configure local hostname resolution through mDNS
+      ansible.builtin.lineinfile:
+        path: /etc/nsswitch.conf
+        regexp: '^hosts:'
+        line: 'hosts:          files mdns4 [NOTFOUND=return] dns'
+        backup: true
+    - name: Enable and start Avahi mDNS service
+      ansible.builtin.systemd:
+        name: avahi-daemon
+        enabled: true
+        state: started
+    - name: Configure Avahi for IPv4-only mDNS
+      ansible.builtin.lineinfile:
+        path: /etc/avahi/avahi-daemon.conf
+        regexp: "^#?{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: false
+      loop:
+        - { key: use-ipv4, value: 'yes' }
+        - { key: use-ipv6, value: 'no' }
+        - { key: publish-addresses, value: 'yes' }
+      notify: Restart Avahi
+    - name: Create system USB mount root
+      ansible.builtin.file:
+        path: /media/jukebox
+        state: directory
+        owner: jukebox
+        group: audio
+        mode: '0755'
+    - name: Install USB mount helper
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/jukebox-mount
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          set -eu
+          device="/dev/$1"
+          label="$(blkid -o value -s LABEL "$device" 2>/dev/null || true)"
+          mountpoint="/media/jukebox/${label:-$1}"
+          mkdir -p "$mountpoint"
+          uid="$(id -u jukebox)"
+          gid="$(id -g jukebox)"
+          type="$(blkid -o value -s TYPE "$device" 2>/dev/null || true)"
+          case "$type" in
+            vfat|exfat|ntfs|ntfs3) mount -o "uid=$uid,gid=$gid,umask=022" "$device" "$mountpoint" ;;
+            *) mount "$device" "$mountpoint" ;;
+          esac
+          chown jukebox:audio "$mountpoint" 2>/dev/null || true
+    - name: Install USB unmount helper
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/jukebox-unmount
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          umount "/media/jukebox/$1" 2>/dev/null || true
+          rmdir "/media/jukebox/$1" 2>/dev/null || true
+    - name: Install systemd USB mount unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/jukebox-usb@.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Mount USB storage for EMOM Jukebox (%i)
+          BindsTo=dev-%i.device
+          After=dev-%i.device
+          Before=jukebox.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/jukebox-mount %i
+          ExecStop=/usr/local/sbin/jukebox-unmount %i
+    - name: Install udev rule for USB storage
+      ansible.builtin.copy:
+        dest: /etc/udev/rules.d/99-jukebox-usb.rules
+        mode: '0644'
+        content: |
+          ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="jukebox-usb@%k.service"
+    - name: Reload udev and systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+    - name: Reload udev rules
+      ansible.builtin.command: udevadm control --reload-rules
+      changed_when: false
+    - name: Trigger USB filesystem discovery
+      ansible.builtin.command: udevadm trigger --subsystem-match=block
+      changed_when: false
+    - name: Create service user
+      ansible.builtin.user:
+        name: jukebox
+        groups: audio
+        append: true
+        system: true
+    - name: Create virtualenv and install dependencies
+      ansible.builtin.pip:
+        requirements: "{{ jukebox_dir }}/requirements.txt"
+        virtualenv: "{{ jukebox_dir }}/.venv"
+        virtualenv_command: python3 -m venv
+    - name: Create TLS directory
+      ansible.builtin.file:
+        path: /etc/jukebox/tls
+        state: directory
+        mode: '0755'
+    - name: Generate self-signed certificate
+      ansible.builtin.command: >-
+        openssl req -x509 -nodes -days 825 -newkey rsa:2048
+        -keyout /etc/jukebox/tls/jukebox.key -out /etc/jukebox/tls/jukebox.crt
+        -subj /CN={{ ansible_facts.fqdn | default(inventory_hostname) }}
+      args:
+        creates: /etc/jukebox/tls/jukebox.crt
+    - name: Allow the jukebox service to read the TLS certificate
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: jukebox
+        group: audio
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /etc/jukebox/tls/jukebox.crt, mode: '0644' }
+        - { path: /etc/jukebox/tls/jukebox.key, mode: '0640' }
+    - name: Install environment
+      ansible.builtin.copy:
+        dest: /etc/jukebox/jukebox.env
+        mode: '0640'
+        content: |
+          JUKEBOX_DATABASE={{ jukebox_dir }}/jukebox.db
+          JUKEBOX_ARTWORK_DIR={{ jukebox_dir }}/artwork
+          JUKEBOX_MUSIC_ROOTS={{ jukebox_music_roots }}
+          JUKEBOX_CERT=/etc/jukebox/tls/jukebox.crt
+          JUKEBOX_KEY=/etc/jukebox/tls/jukebox.key
+          JUKEBOX_CORS_ORIGIN=*
+          JUKEBOX_AUDIO_DEVICE=alsa/plughw:1,0
+    - name: Install systemd unit
+      ansible.builtin.copy:
+        src: ../jukebox.service
+        dest: /etc/systemd/system/jukebox.service
+
+  handlers:
+    - name: Restart Avahi
+      ansible.builtin.systemd:
+        name: avahi-daemon
+        state: restarted
